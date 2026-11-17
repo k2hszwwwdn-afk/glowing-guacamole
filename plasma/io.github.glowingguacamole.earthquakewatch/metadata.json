@@ -1,0 +1,19 @@
+{
+  "KPackageStructure": "Plasma/Applet",
+  "KPlugin": {
+    "Authors": [
+      {
+        "Name": "NeoMatrix789"
+      }
+    ],
+    "Category": "Utilities",
+    "Description": "Live USGS earthquake activity and event statistics",
+    "EnabledByDefault": true,
+    "Icon": "earthwatch",
+    "Id": "io.github.glowingguacamole.earthquakewatch",
+    "License": "MIT",
+    "Name": "EarthWatch",
+    "Version": "1.1"
+  },
+  "X-Plasma-API-Minimum-Version": "6.0"
+}
