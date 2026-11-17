@@ -4,7 +4,7 @@ set -euo pipefail
 project_dir="$(cd -- "$(dirname -- "$0")" && pwd)"
 
 if ! command -v python3 >/dev/null 2>&1; then
-    printf 'Python 3 is required to install EarthWatch.\n' >&2
+    printf 'Python 3 is required to install Shaker Breaker.\n' >&2
     exit 1
 fi
 
@@ -27,10 +27,10 @@ install -m 0644 "$project_dir/icons/earthwatch.svg" "$icons_dir/earthwatch.svg"
 cat > "$applications_dir/earthwatch.desktop" <<EOF
 [Desktop Entry]
 Type=Application
-Name=EarthWatch
-Name[zh_CN]=地震观察
-Name[es]=EarthWatch
-Name[ar]=مراقب الزلازل
+Name=Shaker Breaker
+Name[zh_CN]=Shaker Breaker
+Name[es]=Shaker Breaker
+Name[ar]=Shaker Breaker
 Comment=Live global earthquake activity from USGS
 Comment[zh_CN]=USGS 全球地震实时活动
 Comment[es]=Actividad sísmica global en vivo de USGS
@@ -55,4 +55,4 @@ else
         "$project_dir/plasma/$applet_id"
 fi
 
-printf 'EarthWatch installed. Launch it from the application menu, then add the EarthWatch widget to a panel.\n'
+printf 'Shaker Breaker installed. Launch it from the application menu, then add the Shaker Breaker widget to a panel.\n'

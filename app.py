@@ -1,27 +1,28 @@
-"""EarthWatch: a live USGS earthquake dashboard for KDE and Linux desktops."""
+"""Shaker Breaker: a live USGS earthquake dashboard for KDE and Linux desktops."""
 
 from __future__ import annotations
 
 import math
-import html
-import json
-import re
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
-from PySide6.QtCore import QPointF, QSettings, QThread, QTimer, Qt, Signal, QUrl
+from PySide6.QtCore import QPointF, QSize, QSettings, QThread, QTimer, Qt, Signal, QUrl
 from PySide6.QtGui import (
     QColor,
     QDesktopServices,
+    QImage,
+    QIcon,
     QLinearGradient,
     QPainter,
     QPainterPath,
     QPen,
     QPixmap,
     QRadialGradient,
+    QTransform,
 )
 from PySide6.QtWidgets import (
     QApplication,
@@ -47,6 +48,33 @@ from translations import LANGUAGE_NAMES, translate
 REFRESH_INTERVAL_MS = 30_000
 ACCENT = "#59e1d0"
 MUTED = "#8195a5"
+MIN_ZOOM = 1.0
+MAX_ZOOM = 32.0
+
+
+def natural_earth_projection(longitude: float, latitude: float) -> tuple[float, float]:
+    """Project WGS84 longitude/latitude into the Natural Earth world-map projection."""
+    lam = math.radians(longitude)
+    phi = math.radians(max(-90.0, min(90.0, latitude)))
+    phi2 = phi * phi
+    phi4 = phi2 * phi2
+    x = lam * (
+        0.8707
+        + phi2
+        * (
+            -0.131979
+            + phi2 * (-0.013791 + phi4 * phi2 * (0.003971 - 0.001529 * phi2))
+        )
+    )
+    y = phi * (
+        1.007226
+        + phi2 * (0.015085 + phi4 * (-0.044475 + 0.028874 * phi2 - 0.005916 * phi4))
+    )
+    return x, y
+
+
+NATURAL_EARTH_MAX_X = math.pi * 0.8707
+NATURAL_EARTH_MAX_Y = natural_earth_projection(0.0, 90.0)[1]
 
 
 class FeedWorker(QThread):
@@ -102,10 +130,49 @@ class PhotoWorker(QThread):
         self.earthquake = event
 
     @staticmethod
+    def snapshot_url(event: Earthquake, day: datetime) -> str:
+        latitude = max(-89.5, min(89.5, event.latitude))
+        longitude = max(-180.0, min(180.0, event.longitude))
+        half_latitude = 1.0
+        half_longitude = min(
+            4.0,
+            max(1.0, half_latitude / max(math.cos(math.radians(latitude)), 0.25)),
+        )
+        min_latitude = max(-90.0, latitude - half_latitude)
+        max_latitude = min(90.0, latitude + half_latitude)
+        min_longitude = longitude - half_longitude
+        max_longitude = longitude + half_longitude
+        if min_longitude < -180.0:
+            max_longitude += -180.0 - min_longitude
+            min_longitude = -180.0
+        if max_longitude > 180.0:
+            min_longitude -= max_longitude - 180.0
+            max_longitude = 180.0
+        query = urlencode(
+            {
+                "SERVICE": "WMS",
+                "REQUEST": "GetMap",
+                "VERSION": "1.3.0",
+                "LAYERS": "MODIS_Terra_CorrectedReflectance_TrueColor",
+                "STYLES": "",
+                "CRS": "EPSG:4326",
+                "BBOX": (
+                    f"{min_latitude:.5f},{min_longitude:.5f},"
+                    f"{max_latitude:.5f},{max_longitude:.5f}"
+                ),
+                "WIDTH": "512",
+                "HEIGHT": "512",
+                "FORMAT": "image/jpeg",
+                "TIME": day.strftime("%Y-%m-%d"),
+            }
+        )
+        return f"https://gibs.earthdata.nasa.gov/wms/epsg4326/best/wms.cgi?{query}"
+
+    @staticmethod
     def _request(url: str, max_bytes: int) -> tuple[bytes, str, str]:
         request = Request(
             url,
-            headers={"User-Agent": "EarthWatch/1.0 (desktop earthquake monitor)"},
+            headers={"User-Agent": "ShakerBreaker/1.0 (desktop earthquake monitor)"},
         )
         with urlopen(request, timeout=12) as response:
             final_url = response.geturl()
@@ -115,94 +182,39 @@ class PhotoWorker(QThread):
             raise ValueError("The archive image is too large.")
         return data, final_url, content_type
 
-    @staticmethod
-    def _plain_text(value: str) -> str:
-        return html.unescape(re.sub(r"<[^>]*>", "", value)).strip()
-
     def run(self) -> None:
-        query = urlencode(
-            {
-                "action": "query",
-                "generator": "geosearch",
-                "ggscoord": f"{self.earthquake.latitude}|{self.earthquake.longitude}",
-                "ggsradius": "10000",
-                "ggsnamespace": "6",
-                "ggslimit": "10",
-                "prop": "imageinfo",
-                "iiprop": "url|extmetadata",
-                "iiurlwidth": "800",
-                "format": "json",
-                "origin": "*",
-            }
-        )
-        try:
-            response_data, final_url, content_type = self._request(
-                f"https://commons.wikimedia.org/w/api.php?{query}", 2_000_000
+        had_response = False
+        event_day = self.earthquake.occurred_at.astimezone(timezone.utc).date()
+        for days_back in range(3):
+            day = datetime.combine(
+                event_day - timedelta(days=days_back),
+                datetime.min.time(),
+                tzinfo=timezone.utc,
             )
+            try:
+                image, image_url, content_type = self._request(
+                    self.snapshot_url(self.earthquake, day), 4_000_000
+                )
+            except (OSError, TimeoutError, ValueError, TypeError):
+                continue
             if (
-                not final_url.startswith("https://commons.wikimedia.org/")
-                or "json" not in content_type
+                not image_url.startswith("https://gibs.earthdata.nasa.gov/")
+                or content_type != "image/jpeg"
             ):
-                raise ValueError("Unexpected Wikimedia API response.")
-            response = json.loads(response_data)
-            pages = response.get("query", {}).get("pages", {})
-            candidates = sorted(
-                pages.values(),
-                key=lambda page: float(page.get("dist", 1_000_000))
-                if isinstance(page, dict)
-                else 1_000_000,
+                continue
+            had_response = True
+            satellite_image = QImage()
+            if len(image) < 3_000 or not satellite_image.loadFromData(image):
+                continue
+            self.photo_found.emit(
+                image,
+                f"MODIS Terra True Color · {day.date().isoformat()}",
+                "NASA GIBS / MODIS Terra",
+                "NASA Earthdata",
+                "https://worldview.earthdata.nasa.gov/",
             )
-            for page in candidates:
-                if not isinstance(page, dict):
-                    continue
-                image_info = page.get("imageinfo")
-                if not isinstance(image_info, list) or not image_info:
-                    continue
-                info = image_info[0]
-                if not isinstance(info, dict):
-                    continue
-                thumbnail_url = info.get("thumburl")
-                if not isinstance(thumbnail_url, str) or not thumbnail_url.startswith(
-                    ("https://thumb.wikimedia.org/", "https://upload.wikimedia.org/")
-                ):
-                    continue
-                image, image_url, image_type = self._request(thumbnail_url, 4_000_000)
-                if (
-                    not image_url.startswith(
-                        ("https://thumb.wikimedia.org/", "https://upload.wikimedia.org/")
-                    )
-                    or not image_type.startswith("image/")
-                ):
-                    continue
-                metadata = info.get("extmetadata", {})
-                metadata = metadata if isinstance(metadata, dict) else {}
-                def metadata_text(key: str, fallback: str) -> str:
-                    value = metadata.get(key)
-                    if isinstance(value, dict):
-                        value = value.get("value", fallback)
-                    return self._plain_text(str(value))[:180] or fallback
-
-                title = metadata_text("ObjectName", str(page.get("title", "Photo")))
-                artist = metadata_text("Artist", "Wikimedia contributor")
-                license_name = metadata_text("LicenseShortName", "License information")
-                source_url = info.get("descriptionurl", "")
-                if not isinstance(source_url, str) or not source_url.startswith(
-                    "https://commons.wikimedia.org/"
-                ):
-                    source_url = "https://commons.wikimedia.org/"
-                self.photo_found.emit(image, title, artist, license_name, source_url)
-                return
-            self.unavailable.emit("not_found")
-        except (
-            OSError,
-            TimeoutError,
-            ValueError,
-            TypeError,
-            AttributeError,
-            UnicodeError,
-            json.JSONDecodeError,
-        ):
-            self.unavailable.emit("failed")
+            return
+        self.unavailable.emit("not_found" if had_response else "failed")
 
 
 class EventDetailsDialog(QDialog):
@@ -275,7 +287,26 @@ class EventDetailsDialog(QDialog):
             metrics.addWidget(tile, index // 3, index % 3)
         layout.addLayout(metrics)
 
-        photo_heading = QLabel(translate(language, "archive_photo"))
+        tsunami_detail = QLabel(
+            translate(
+                language,
+                "tsunami_flag_detail" if event.tsunami else "tsunami_clear_detail",
+            )
+        )
+        tsunami_detail.setWordWrap(True)
+        tsunami_detail.setStyleSheet(
+            "background:#111c26; border:1px solid #263d49; border-radius:8px;"
+            "color:#dce8ed; padding:10px 12px;"
+        )
+        layout.addWidget(tsunami_detail)
+        tsunami_link = QLabel(
+            f'<a href="https://www.tsunami.gov/" style="color:#59e1d0;">'
+            f'{translate(language, "official_tsunami_link")}</a>'
+        )
+        tsunami_link.setOpenExternalLinks(True)
+        layout.addWidget(tsunami_link)
+
+        photo_heading = QLabel(translate(language, "satellite_view"))
         photo_heading.setStyleSheet("color:#9cb0bc; font-size:10px; font-weight:700; letter-spacing:1px;")
         layout.addWidget(photo_heading)
         self.photo_label = QLabel(translate(language, "photo_loading"))
@@ -347,116 +378,233 @@ class EventDetailsDialog(QDialog):
 class EarthquakeMap(QWidget):
     eventSelected = Signal(object)
     zoomChanged = Signal(float)
-    ZOOM_LEVELS = (1.0, 1.5, 2.0, 3.0)
 
     def __init__(self, language: str = "en") -> None:
         super().__init__()
         self.events: list[Earthquake] = []
         self.land_polygons: tuple[LandPolygon, ...] = ()
         self.language = language
-        self.zoom_index = 0
-        self.focus_longitude = 0.0
-        self.focus_latitude = 0.0
+        self._zoom_factor = MIN_ZOOM
+        self.pan_x = 0.0
+        self.pan_y = 0.0
         self.selected_id = ""
-        self._land_cache_key: tuple | None = None
-        self._land_cache_path: QPainterPath | None = None
+        self._land_cache_paths: tuple[QPainterPath, ...] | None = None
+        self._base_map_cache: QPixmap | None = None
+        self._base_map_cache_key: tuple | None = None
+        self._press_position: QPointF | None = None
+        self._last_mouse_position: QPointF | None = None
+        self._dragging = False
+        self._pulse_timer = QTimer(self)
+        self._pulse_timer.setInterval(50)
+        self._pulse_timer.timeout.connect(self.update)
         self.setMinimumHeight(290)
-        self.setCursor(Qt.CursorShape.CrossCursor)
+        self.setCursor(Qt.CursorShape.OpenHandCursor)
 
     @property
     def zoom_factor(self) -> float:
-        return self.ZOOM_LEVELS[self.zoom_index]
+        return self._zoom_factor
 
     def set_language(self, language: str) -> None:
         self.language = language
+        self._base_map_cache_key = None
         self.update()
 
     def set_land_polygons(self, polygons: tuple[LandPolygon, ...]) -> None:
         self.land_polygons = polygons
-        self._land_cache_key = None
+        self._land_cache_paths = None
+        self._base_map_cache_key = None
         self.update()
 
     def set_events(self, events: list[Earthquake]) -> None:
         self.events = events
         if self.selected_id and not any(event.event_id == self.selected_id for event in events):
             self.selected_id = ""
+        if any(event.magnitude is not None and event.magnitude >= 5.0 for event in events):
+            if not self._pulse_timer.isActive():
+                self._pulse_timer.start()
+        else:
+            self._pulse_timer.stop()
         self.update()
 
     def select_event(self, event: Earthquake) -> None:
         self.selected_id = event.event_id
-        if self.zoom_index:
-            self.focus_longitude = event.longitude
-            self.focus_latitude = event.latitude
-            self._land_cache_key = None
+        if self.zoom_factor > MIN_ZOOM:
+            self.pan_x, self.pan_y = natural_earth_projection(
+                event.longitude,
+                event.latitude,
+            )
+            self._constrain_pan()
+            self._base_map_cache_key = None
         self.update()
 
     def zoom_in(self) -> None:
-        if self.zoom_index < len(self.ZOOM_LEVELS) - 1:
-            self.zoom_index += 1
-            self._focus_selected()
-            self.zoomChanged.emit(self.zoom_factor)
-            self.update()
+        self._zoom_at(self._map_rect().center(), min(MAX_ZOOM, self.zoom_factor * 1.2))
 
     def zoom_out(self) -> None:
-        if self.zoom_index > 0:
-            self.zoom_index -= 1
-            self._focus_selected()
-            if not self.zoom_index:
-                self.focus_longitude = 0.0
-                self.focus_latitude = 0.0
-            self.zoomChanged.emit(self.zoom_factor)
-            self._land_cache_key = None
-            self.update()
+        self._zoom_at(self._map_rect().center(), max(MIN_ZOOM, self.zoom_factor / 1.2))
 
     def reset_zoom(self) -> None:
-        self.zoom_index = 0
-        self.focus_longitude = 0.0
-        self.focus_latitude = 0.0
-        self._land_cache_key = None
+        self._zoom_factor = MIN_ZOOM
+        self.pan_x = 0.0
+        self.pan_y = 0.0
+        self._base_map_cache_key = None
+        self.zoomChanged.emit(self._zoom_factor)
+        self.update()
+
+    def _map_rect(self):
+        return self.rect().adjusted(1, 1, -1, -1).adjusted(20, 27, -20, -30)
+
+    @staticmethod
+    def _base_scale(rect) -> float:
+        return min(
+            rect.width() / (2 * NATURAL_EARTH_MAX_X),
+            rect.height() / (2 * NATURAL_EARTH_MAX_Y),
+        )
+
+    def _scale(self, rect) -> float:
+        return self._base_scale(rect) * self.zoom_factor
+
+    def _constrain_pan(self, rect=None) -> None:
+        rect = rect or self._map_rect()
+        scale = self._scale(rect)
+        half_width = rect.width() / (2 * scale)
+        half_height = rect.height() / (2 * scale)
+        self.pan_x = (
+            0.0
+            if half_width >= NATURAL_EARTH_MAX_X
+            else max(
+                -NATURAL_EARTH_MAX_X + half_width,
+                min(NATURAL_EARTH_MAX_X - half_width, self.pan_x),
+            )
+        )
+        self.pan_y = (
+            0.0
+            if half_height >= NATURAL_EARTH_MAX_Y
+            else max(
+                -NATURAL_EARTH_MAX_Y + half_height,
+                min(NATURAL_EARTH_MAX_Y - half_height, self.pan_y),
+            )
+        )
+
+    def _zoom_at(self, position: QPointF, zoom: float) -> None:
+        zoom = max(MIN_ZOOM, min(MAX_ZOOM, zoom))
+        if math.isclose(zoom, self.zoom_factor, rel_tol=1e-6):
+            return
+        rect = self._map_rect()
+        old_scale = self._scale(rect)
+        anchor_x = self.pan_x + (position.x() - rect.center().x()) / old_scale
+        anchor_y = self.pan_y - (position.y() - rect.center().y()) / old_scale
+        self._zoom_factor = zoom
+        new_scale = self._scale(rect)
+        self.pan_x = anchor_x - (position.x() - rect.center().x()) / new_scale
+        self.pan_y = anchor_y + (position.y() - rect.center().y()) / new_scale
+        self._constrain_pan(rect)
+        self._base_map_cache_key = None
         self.zoomChanged.emit(self.zoom_factor)
         self.update()
 
-    def _focus_selected(self) -> None:
-        selected = next(
-            (event for event in self.events if event.event_id == self.selected_id),
-            None,
-        )
-        if selected is not None:
-            self.focus_longitude = selected.longitude
-            self.focus_latitude = selected.latitude
-        self._land_cache_key = None
-
-    def _project(self, longitude: float, latitude: float, rect) -> QPointF:
-        delta_longitude = (longitude - self.focus_longitude + 180) % 360 - 180
-        x = rect.center().x() + delta_longitude / 360 * rect.width() * self.zoom_factor
-        y = rect.center().y() - (latitude - self.focus_latitude) / 170 * rect.height() * self.zoom_factor
+    def _project(self, longitude: float, latitude: float, rect=None) -> QPointF:
+        rect = rect or self._map_rect()
+        x, y = natural_earth_projection(longitude, latitude)
+        scale = self._scale(rect)
+        x = rect.center().x() + (x - self.pan_x) * scale
+        y = rect.center().y() - (y - self.pan_y) * scale
         return QPointF(x, y)
 
-    def _land_path(self, rect) -> QPainterPath:
-        key = (
-            rect.width(),
-            rect.height(),
-            self.zoom_factor,
-            round(self.focus_longitude, 4),
-            round(self.focus_latitude, 4),
-        )
-        if key == self._land_cache_key and self._land_cache_path is not None:
-            return self._land_cache_path
-
-        path = QPainterPath()
-        path.setFillRule(Qt.FillRule.OddEvenFill)
+    def _land_paths(self) -> tuple[QPainterPath, ...]:
+        if self._land_cache_paths is not None:
+            return self._land_cache_paths
+        paths = []
         for polygon in self.land_polygons:
+            path = QPainterPath()
+            path.setFillRule(Qt.FillRule.OddEvenFill)
             for ring in polygon:
                 if len(ring) < 4:
                     continue
-                first = self._project(ring[0][0], ring[0][1], rect)
-                path.moveTo(first)
+                first = natural_earth_projection(ring[0][0], ring[0][1])
+                path.moveTo(QPointF(*first))
                 for longitude, latitude in ring[1:]:
-                    path.lineTo(self._project(longitude, latitude, rect))
+                    path.lineTo(*natural_earth_projection(longitude, latitude))
                 path.closeSubpath()
-        self._land_cache_key = key
-        self._land_cache_path = path
-        return path
+            paths.append(path)
+        self._land_cache_paths = tuple(paths)
+        return self._land_cache_paths
+
+    def _base_cache_key(self) -> tuple:
+        return (
+            self.size(),
+            self.devicePixelRatioF(),
+            round(self.zoom_factor, 6),
+            round(self.pan_x, 8),
+            round(self.pan_y, 8),
+            self.language,
+        )
+
+    def _render_base_map(self) -> QPixmap:
+        dpr = self.devicePixelRatioF()
+        size = QSize(round(self.width() * dpr), round(self.height() * dpr))
+        pixmap = QPixmap(size)
+        pixmap.setDevicePixelRatio(dpr)
+        pixmap.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        bounds = self.rect().adjusted(1, 1, -1, -1)
+        panel = QPainterPath()
+        panel.addRoundedRect(bounds, 14, 14)
+        gradient = QLinearGradient(0, 0, self.width(), self.height())
+        gradient.setColorAt(0, QColor("#101f2a"))
+        gradient.setColorAt(1, QColor("#0b151e"))
+        painter.fillPath(panel, gradient)
+
+        map_rect = self._map_rect()
+        painter.save()
+        painter.setClipPath(panel)
+        painter.setClipRect(map_rect, Qt.ClipOperation.IntersectClip)
+        scale = self._scale(map_rect)
+        transform = QTransform(
+            scale,
+            0,
+            0,
+            -scale,
+            map_rect.center().x() - self.pan_x * scale,
+            map_rect.center().y() + self.pan_y * scale,
+        )
+        painter.setWorldTransform(transform)
+        painter.setPen(QPen(QColor(102, 176, 184, 36), 0, Qt.PenStyle.DashLine))
+        for latitude in (-75, -60, -45, -30, -15, 0, 15, 30, 45, 60, 75):
+            start = natural_earth_projection(-180, latitude)
+            end = natural_earth_projection(180, latitude)
+            painter.drawLine(QPointF(*start), QPointF(*end))
+        for longitude in range(-150, 180, 30):
+            path = QPainterPath()
+            for index, latitude in enumerate(range(-85, 86, 2)):
+                point = natural_earth_projection(longitude, latitude)
+                if index == 0:
+                    path.moveTo(QPointF(*point))
+                else:
+                    path.lineTo(QPointF(*point))
+            painter.drawPath(path)
+
+        painter.setPen(QPen(QColor("#365b64"), 0))
+        painter.setBrush(QColor(38, 77, 84, 190))
+        for path in self._land_paths():
+            painter.drawPath(path)
+        painter.restore()
+
+        painter.setPen(QPen(QColor("#78a1ac"), 1))
+        painter.drawText(
+            bounds.adjusted(15, 10, -15, 0),
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop,
+            translate(self.language, "epicenter_field"),
+        )
+        painter.setPen(QColor("#597987"))
+        painter.drawText(
+            bounds.adjusted(0, 10, -15, 0),
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignTop,
+            translate(self.language, "global_live"),
+        )
+        painter.end()
+        return pixmap
 
     @staticmethod
     def event_color(magnitude: float | None) -> QColor:
@@ -473,100 +621,147 @@ class EarthquakeMap(QWidget):
     def paintEvent(self, _event) -> None:
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        cache_key = self._base_cache_key()
+        if self._base_map_cache is None or self._base_map_cache_key != cache_key:
+            self._base_map_cache = self._render_base_map()
+            self._base_map_cache_key = cache_key
+        painter.drawPixmap(0, 0, self._base_map_cache)
+
         bounds = self.rect().adjusted(1, 1, -1, -1)
         panel = QPainterPath()
         panel.addRoundedRect(bounds, 14, 14)
-        gradient = QLinearGradient(0, 0, self.width(), self.height())
-        gradient.setColorAt(0, QColor("#101f2a"))
-        gradient.setColorAt(1, QColor("#0b151e"))
-        painter.fillPath(panel, gradient)
-
-        map_rect = bounds.adjusted(20, 27, -20, -30)
-        painter.save()
+        map_rect = self._map_rect()
         painter.setClipPath(panel)
         painter.setClipRect(map_rect, Qt.ClipOperation.IntersectClip)
-        grid_pen = QPen(QColor(102, 176, 184, 36), 1, Qt.PenStyle.DashLine)
-        painter.setPen(grid_pen)
-        for latitude in (-60, -30, 0, 30, 60):
-            y = self._project(0, latitude, map_rect).y()
-            painter.drawLine(QPointF(map_rect.left(), y), QPointF(map_rect.right(), y))
-        for longitude in range(-180, 181, 30):
-            point = self._project(longitude, 0, map_rect)
-            painter.drawLine(QPointF(point.x(), map_rect.top()), QPointF(point.x(), map_rect.bottom()))
-
-        painter.setPen(QPen(QColor("#365b64"), 0.6))
-        painter.setBrush(QColor(38, 77, 84, 190))
-        if self.land_polygons:
-            painter.drawPath(self._land_path(map_rect))
-
+        pulse = (math.sin(time.monotonic() * math.tau / 1.6) + 1) / 2
         for index, quake in enumerate(self.events[:1500]):
             point = self._project(quake.longitude, quake.latitude, map_rect)
-            if not map_rect.adjusted(-10, -10, 10, 10).contains(point.toPoint()):
+            if not map_rect.adjusted(-20, -20, 20, 20).contains(point.toPoint()):
                 continue
             magnitude = quake.magnitude or 0
             radius = min(3.0 + magnitude * 1.15, 12.0)
-            color = self.event_color(quake.magnitude)
+            is_pulsing = quake.magnitude is not None and quake.magnitude >= 5.0
+            pulse_scale = 1.0 + pulse * 0.35 if is_pulsing else 1.0
+            color = QColor("#ffffff") if quake.tsunami else self.event_color(quake.magnitude)
             is_selected = quake.event_id == self.selected_id
-            glow = QRadialGradient(point, radius * (3.3 if is_selected else 2.7))
+            glow_radius = radius * (2.7 + pulse * 1.2 if is_pulsing else 2.7)
+            glow = QRadialGradient(point, glow_radius)
             halo = QColor(color)
-            halo.setAlpha(100 if is_selected else 70)
+            halo.setAlpha(
+                min(235, (120 if is_selected else 75) + int(pulse * 90))
+                if is_pulsing
+                else (110 if is_selected else 70)
+            )
             glow.setColorAt(0, halo)
             glow.setColorAt(1, QColor(color.red(), color.green(), color.blue(), 0))
             painter.setPen(Qt.PenStyle.NoPen)
             painter.setBrush(glow)
-            painter.drawEllipse(point, radius * 3.3, radius * 3.3)
+            painter.drawEllipse(point, glow_radius, glow_radius)
+            if quake.tsunami:
+                painter.setPen(QPen(QColor("#0a1118"), 1.0))
+            else:
+                painter.setPen(Qt.PenStyle.NoPen)
             painter.setBrush(color)
-            painter.drawEllipse(point, radius + (1.5 if is_selected else 0), radius + (1.5 if is_selected else 0))
+            core_radius = radius * pulse_scale + (1.5 if is_selected else 0)
+            painter.drawEllipse(point, core_radius, core_radius)
             if magnitude >= 5 and index < 10:
                 painter.setPen(QColor("#f4fafb"))
-                painter.drawText(point + QPointF(radius + 4, -radius - 2), f"M{magnitude:.1f}")
-        painter.restore()
+                painter.drawText(
+                    point + QPointF(core_radius + 4, -core_radius - 2),
+                    f"M{magnitude:.1f}",
+                )
+        painter.end()
 
-        painter.setPen(QPen(QColor("#78a1ac"), 1))
-        painter.drawText(
-            bounds.adjusted(15, 10, -15, 0),
-            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop,
-            translate(self.language, "epicenter_field"),
-        )
-        painter.setPen(QColor("#597987"))
-        painter.drawText(
-            bounds.adjusted(0, 10, -15, 0),
-            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignTop,
-            translate(self.language, "global_live"),
-        )
+    def _nearest_event(self, position: QPointF) -> Earthquake | None:
+        map_rect = self._map_rect()
+        nearest: Earthquake | None = None
+        nearest_distance = 18.0
+        for quake in self.events:
+            point = self._project(quake.longitude, quake.latitude, map_rect)
+            distance = math.hypot(point.x() - position.x(), point.y() - position.y())
+            if distance < nearest_distance:
+                nearest = quake
+                nearest_distance = distance
+        return nearest
 
     def mousePressEvent(self, event) -> None:
-        if event.button() == Qt.MouseButton.LeftButton:
-            bounds = self.rect().adjusted(1, 1, -1, -1)
-            map_rect = bounds.adjusted(20, 27, -20, -30)
-            click = event.position()
-            nearest: Earthquake | None = None
-            nearest_distance = 15.0
-            for quake in self.events:
-                point = self._project(quake.longitude, quake.latitude, map_rect)
-                distance = math.hypot(point.x() - click.x(), point.y() - click.y())
-                if distance < nearest_distance:
-                    nearest = quake
-                    nearest_distance = distance
-            if nearest is not None:
-                self.select_event(nearest)
-                self.eventSelected.emit(nearest)
-                return
+        if event.button() == Qt.MouseButton.LeftButton and self._map_rect().contains(
+            event.position().toPoint()
+        ):
+            self._press_position = event.position()
+            self._last_mouse_position = event.position()
+            self._dragging = False
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            event.accept()
+            return
         super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:
+        if (
+            self._press_position is not None
+            and self._last_mouse_position is not None
+            and event.buttons() & Qt.MouseButton.LeftButton
+        ):
+            position = event.position()
+            if not self._dragging and math.hypot(
+                position.x() - self._press_position.x(),
+                position.y() - self._press_position.y(),
+            ) >= 4:
+                self._dragging = True
+            if self._dragging:
+                delta = position - self._last_mouse_position
+                scale = self._scale(self._map_rect())
+                self.pan_x -= delta.x() / scale
+                self.pan_y += delta.y() / scale
+                self._constrain_pan()
+                self._base_map_cache_key = None
+                self.update()
+            self._last_mouse_position = position
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton and self._press_position is not None:
+            position = event.position()
+            dragged = self._dragging
+            self._press_position = None
+            self._last_mouse_position = None
+            self._dragging = False
+            self.setCursor(Qt.CursorShape.OpenHandCursor)
+            if not dragged:
+                nearest = self._nearest_event(position)
+                if nearest is not None:
+                    self.select_event(nearest)
+                    self.eventSelected.emit(nearest)
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def wheelEvent(self, event) -> None:
+        delta = event.angleDelta().y() or event.pixelDelta().y()
+        if not delta:
+            super().wheelEvent(event)
+            return
+        zoom = max(
+            MIN_ZOOM,
+            min(MAX_ZOOM, self.zoom_factor * 1.2 ** (delta / 120)),
+        )
+        self._zoom_at(event.position(), zoom)
+        event.accept()
 
 
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
+        app_icon = QIcon(str(Path(__file__).resolve().parent / "icons" / "earthwatch.svg"))
+        self.setWindowIcon(app_icon)
+        QApplication.instance().setWindowIcon(app_icon)
         self.settings = QSettings("Glowing Guacamole", "EarthWatch")
         saved_language = str(self.settings.value("language", "en"))
         self.language = saved_language if saved_language in LANGUAGE_NAMES else "en"
-        direction = (
-            Qt.LayoutDirection.RightToLeft
-            if self.language == "ar"
-            else Qt.LayoutDirection.LeftToRight
-        )
-        QApplication.instance().setLayoutDirection(direction)
+        QApplication.instance().setLayoutDirection(Qt.LayoutDirection.LeftToRight)
+        self.setLayoutDirection(Qt.LayoutDirection.LeftToRight)
         self.resize(1240, 830)
         self.setMinimumSize(980, 680)
         self.snapshot: FeedSnapshot | None = None
@@ -602,10 +797,17 @@ class MainWindow(QMainWindow):
             QLabel#statNote { color: #8ba0ad; font-size: 11px; }
             QLabel#sectionTitle { color: #dce8ed; font-size: 14px; font-weight: 700; }
             QLabel#eyebrow { color: #59e1d0; font-size: 10px; font-weight: 700; letter-spacing: 2px; }
-            QComboBox, QPushButton { background: #14232e; border: 1px solid #263d49; border-radius: 8px; padding: 8px 11px; }
+            QComboBox, QPushButton { background: #14232e; border: 1px solid #263d49; border-radius: 8px; padding: 7px 10px; min-height: 22px; }
+            QComboBox { padding-right: 30px; }
+            QComboBox::drop-down { subcontrol-origin: padding; subcontrol-position: top right; width: 26px; border: 0; border-left: 1px solid #263d49; border-top-right-radius: 7px; border-bottom-right-radius: 7px; background: #14232e; }
+            QComboBox QAbstractItemView { background: #14232e; color: #e5eef3; border: 1px solid #263d49; selection-background-color: #17313a; selection-color: #e5eef3; outline: 0; }
             QComboBox:hover, QPushButton:hover { border-color: #59e1d0; }
+            QComboBox::drop-down:hover { background: #1b303a; }
             QPushButton#refreshButton { color: #081412; background: #59e1d0; border: 0; font-weight: 700; }
             QPushButton#refreshButton:hover { background: #82f2df; }
+            QPushButton#coffeeButton { color: #1b1700; background: #ffdd00; border: 1px solid #e6c700; border-radius: 8px; padding: 5px 10px; min-height: 24px; font-size: 10px; font-weight: 800; }
+            QPushButton#coffeeButton:hover { background: #ffe84d; border-color: #ffdd00; }
+            QPushButton#coffeeButton:pressed { background: #edcf00; }
             QListWidget { background: transparent; border: 0; outline: 0; }
             QListWidget::item { border-bottom: 1px solid #20313a; padding: 7px 3px; }
             QListWidget::item:selected { background: #17313a; border-radius: 7px; }
@@ -630,7 +832,7 @@ class MainWindow(QMainWindow):
             "color:#59e1d0; font-size:31px; font-weight:700;"
         )
         brand_text = QVBoxLayout()
-        self.brand_title = QLabel("EARTHWATCH")
+        self.brand_title = QLabel("Shaker Breaker")
         self.brand_title.setStyleSheet("font-size:21px; font-weight:800; letter-spacing:2px;")
         self.brand_subtitle = QLabel()
         self.brand_subtitle.setStyleSheet(f"color:{MUTED}; font-size:11px;")
@@ -730,13 +932,28 @@ class MainWindow(QMainWindow):
         legend.addWidget(self.legend_heading)
         legend.addStretch(1)
         self.legend_labels: list[QLabel] = []
-        for color, caption in (
-            ("#59e1d0", "<2.5"),
-            ("#ffd166", "2.5+"),
-            ("#ff9a57", "4.0+"),
-            ("#ff667a", "6.0+"),
+        self.legend_colors = (
+            "#59e1d0",
+            "#ffd166",
+            "#ff9a57",
+            "#ff667a",
+            "#ff9a57",
+            "#ffffff",
+        )
+        self.legend_captions = (
+            "<2.5",
+            "2.5+",
+            "4.0+",
+            "6.0+",
+            "pulse_legend",
+            "tsunami_legend",
+        )
+        for color, caption in zip(
+            self.legend_colors,
+            self.legend_captions,
         ):
-            key = QLabel(f"●  {caption}")
+            text = self.tr(caption) if caption in ("pulse_legend", "tsunami_legend") else caption
+            key = QLabel(f"●  {text}")
             key.setStyleSheet(f"color:{color}; font-size:10px;")
             self.legend_labels.append(key)
             legend.addWidget(key)
@@ -776,9 +993,14 @@ class MainWindow(QMainWindow):
         )
         self.footer_warning = QLabel()
         self.footer_warning.setStyleSheet("color:#617885; font-size:9px; font-weight:700; letter-spacing:1px;")
+        self.coffee_button = QPushButton()
+        self.coffee_button.setObjectName("coffeeButton")
+        self.coffee_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.coffee_button.clicked.connect(self._open_coffee_link)
         footer.addWidget(self.footer_source)
         footer.addStretch(1)
         footer.addWidget(self.footer_warning)
+        footer.addWidget(self.coffee_button)
         main.addLayout(footer)
         self.setCentralWidget(central)
         self._retranslate()
@@ -798,19 +1020,12 @@ class MainWindow(QMainWindow):
             return
         self.language = language
         self.settings.setValue("language", language)
-        direction = (
-            Qt.LayoutDirection.RightToLeft
-            if language == "ar"
-            else Qt.LayoutDirection.LeftToRight
-        )
-        QApplication.instance().setLayoutDirection(direction)
-        self.setLayoutDirection(direction)
         self.map.set_language(language)
         self._retranslate()
 
     def _retranslate(self) -> None:
         self.setWindowTitle(self.tr("app_title"))
-        self.brand_title.setText(self.tr("app_title").upper() if self.language != "zh" else self.tr("app_title"))
+        self.brand_title.setText(self.tr("app_title"))
         self.brand_subtitle.setText(self.tr("tagline"))
         self.language_label.setText(self.tr("language"))
         for index, key in enumerate(
@@ -834,13 +1049,24 @@ class MainWindow(QMainWindow):
                 card.note.setText(self.tr("waiting_feed"))
         self.map_heading_label.setText(self.tr("global_activity"))
         self.legend_heading.setText(self.tr("magnitude_key"))
+        for label, color, caption in zip(
+            self.legend_labels,
+            self.legend_colors,
+            self.legend_captions,
+        ):
+            text = self.tr(caption) if caption in ("pulse_legend", "tsunami_legend") else caption
+            label.setText(f"●  {text}")
+            label.setStyleSheet(f"color:{color}; font-size:10px;")
         self.latest_heading.setText(self.tr("latest_events"))
         self.event_explainer.setText(self.tr("select_event"))
         self.footer_source.setText(self.tr("source"))
         self.footer_warning.setText(self.tr("not_warning"))
+        self.coffee_button.setText(f"☕  {self.tr('buy_me_coffee')}")
+        self.coffee_button.setToolTip(self.tr("buy_me_coffee"))
         self.zoom_in_button.setToolTip(self.tr("zoom_in"))
         self.zoom_out_button.setToolTip(self.tr("zoom_out"))
         self.zoom_reset_button.setToolTip(self.tr("zoom_reset"))
+        self.map.setToolTip(self.tr("map_controls"))
         if self.snapshot is None:
             self.status_label.setText(self.tr("connecting"))
         elif self.last_error:
@@ -849,6 +1075,9 @@ class MainWindow(QMainWindow):
             self._update_status()
         if self.snapshot is not None:
             self._render_snapshot()
+
+    def _open_coffee_link(self) -> None:
+        QDesktopServices.openUrl(QUrl("https://buymeacoffee.com/neomatrix847"))
 
     def _zoom_changed(self, zoom: float) -> None:
         self.zoom_level_label.setText(f"{zoom:g}×")
@@ -1048,7 +1277,8 @@ class MainWindow(QMainWindow):
 
 def main() -> int:
     application = QApplication(sys.argv)
-    application.setApplicationName("EarthWatch")
+    application.setApplicationName("Shaker Breaker")
+    application.setApplicationVersion("1.0")
     application.setOrganizationName("Glowing Guacamole")
     window = MainWindow()
     window.show()

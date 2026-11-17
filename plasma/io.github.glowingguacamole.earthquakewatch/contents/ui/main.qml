@@ -1,6 +1,7 @@
 import QtQuick
 import QtQuick.Controls as QQC2
 import QtQuick.Layouts
+import org.kde.plasma.core as PlasmaCore
 import org.kde.plasma.plasmoid
 
 PlasmoidItem {
@@ -22,7 +23,7 @@ PlasmoidItem {
     function tr(key) {
         var catalog = {
             en: {
-                appTitle: "EarthWatch", loading: "EarthWatch…", live: "● LIVE", offline: "OFFLINE",
+                appTitle: "Shaker Breaker", loading: "Shaker Breaker…", live: "● LIVE", offline: "OFFLINE",
                 headline: "GLOBAL SEISMIC ACTIVITY", pastDay: "PAST 24 HOURS",
                 reported: "reported earthquakes", strongest: "STRONGEST", awaiting: "Awaiting events",
                 latest: "LATEST EVENTS", refresh: "Refresh now", unknown: "Unknown location",
@@ -32,7 +33,7 @@ PlasmoidItem {
                 depth: "deep", feed: "USGS feed"
             },
             zh: {
-                appTitle: "地震观察", loading: "地震观察…", live: "● 实时", offline: "离线",
+                appTitle: "Shaker Breaker", loading: "Shaker Breaker…", live: "● 实时", offline: "离线",
                 headline: "全球地震活动", pastDay: "过去 24 小时",
                 reported: "次地震", strongest: "最强地震", awaiting: "等待地震事件",
                 latest: "最新事件", refresh: "立即刷新", unknown: "位置未知",
@@ -42,7 +43,7 @@ PlasmoidItem {
                 depth: "深", feed: "USGS 数据"
             },
             es: {
-                appTitle: "EarthWatch", loading: "EarthWatch…", live: "● EN VIVO", offline: "SIN CONEXIÓN",
+                appTitle: "Shaker Breaker", loading: "Shaker Breaker…", live: "● EN VIVO", offline: "SIN CONEXIÓN",
                 headline: "ACTIVIDAD SÍSMICA GLOBAL", pastDay: "ÚLTIMAS 24 HORAS",
                 reported: "terremotos registrados", strongest: "MÁS FUERTE", awaiting: "Esperando eventos",
                 latest: "EVENTOS RECIENTES", refresh: "Actualizar ahora", unknown: "Ubicación desconocida",
@@ -52,7 +53,7 @@ PlasmoidItem {
                 depth: "de profundidad", feed: "Fuente USGS"
             },
             ar: {
-                appTitle: "مراقب الزلازل", loading: "جارٍ التحميل…", live: "● مباشر", offline: "غير متصل",
+                appTitle: "Shaker Breaker", loading: "جارٍ التحميل…", live: "● مباشر", offline: "غير متصل",
                 headline: "النشاط الزلزالي العالمي", pastDay: "آخر 24 ساعة",
                 reported: "زلازل مسجلة", strongest: "الأقوى", awaiting: "بانتظار الأحداث",
                 latest: "أحدث الأحداث", refresh: "تحديث الآن", unknown: "موقع غير معروف",
@@ -231,12 +232,14 @@ PlasmoidItem {
         implicitHeight: 460
         Layout.minimumWidth: 320
         Layout.minimumHeight: 360
+        Plasmoid.backgroundHints: PlasmaCore.Types.NoBackground
         LayoutMirroring.enabled: root.language === "ar"
         LayoutMirroring.childrenInherit: true
 
         Rectangle {
             anchors.fill: parent
             radius: 16
+            antialiasing: true
             color: "#0c151d"
             border.color: "#1d3440"
         }

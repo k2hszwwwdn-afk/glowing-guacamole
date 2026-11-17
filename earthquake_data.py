@@ -158,7 +158,7 @@ def fetch_feed(url: str) -> FeedSnapshot:
         headers={
             "Accept": "application/geo+json, application/json",
             "Cache-Control": "no-cache",
-            "User-Agent": "EarthWatch/1.0 (desktop earthquake monitor)",
+            "User-Agent": "ShakerBreaker/1.0 (desktop earthquake monitor)",
         },
     )
     try:

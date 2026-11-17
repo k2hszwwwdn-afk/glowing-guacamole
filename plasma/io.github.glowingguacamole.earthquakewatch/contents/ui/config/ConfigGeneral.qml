@@ -15,7 +15,7 @@ KCM.SimpleKCM {
         spacing: 10
 
         QQC2.Label {
-            text: i18n("Choose the language used by the EarthWatch widget.")
+            text: i18n("Choose the language used by the Shaker Breaker widget.")
             wrapMode: Text.WordWrap
             Layout.fillWidth: true
         }

@@ -9,7 +9,13 @@ class TranslationTests(unittest.TestCase):
         for language in LANGUAGE_NAMES:
             with self.subTest(language=language):
                 self.assertTrue(translate(language, "event_details"))
+                self.assertTrue(translate(language, "satellite_view"))
                 self.assertTrue(translate(language, "photo_disclaimer"))
+                self.assertTrue(translate(language, "map_controls"))
+                self.assertTrue(translate(language, "pulse_legend"))
+                self.assertTrue(translate(language, "tsunami_legend"))
+                self.assertTrue(translate(language, "tsunami_flag_detail"))
+                self.assertTrue(translate(language, "buy_me_coffee"))
 
     def test_named_values_are_formatted_in_each_language(self):
         for language in LANGUAGE_NAMES:

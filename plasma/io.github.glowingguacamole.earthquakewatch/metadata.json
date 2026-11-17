@@ -7,13 +7,13 @@
       }
     ],
     "Category": "Utilities",
-    "Description": "Live USGS earthquake activity and event statistics",
+    "Description": "Live USGS earthquake activity, tsunami flags, and event statistics",
     "EnabledByDefault": true,
     "Icon": "earthwatch",
     "Id": "io.github.glowingguacamole.earthquakewatch",
     "License": "MIT",
-    "Name": "EarthWatch",
-    "Version": "1.1"
+    "Name": "Shaker Breaker",
+    "Version": "1.0"
   },
   "X-Plasma-API-Minimum-Version": "6.0"
 }
